@@ -40,6 +40,8 @@
 #include <X11/extensions/Xinerama.h>
 #endif /* XINERAMA */
 #include <X11/Xft/Xft.h>
+#include <X11/Xlib-xcb.h>
+#include <xcb/res.h>
 
 #include "drw.h"
 #include "util.h"
@@ -93,6 +95,7 @@ struct Client {
 	int bw, oldbw;
 	unsigned int tags;
 	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen;
+    pid_t pid;
 	Client *next;
 	Client *snext;
 	Monitor *mon;
@@ -141,6 +144,15 @@ typedef struct {
 	int monitor;
 } Rule;
 
+/*own structs*/
+typedef struct {
+    const char** path;
+    int spawncount;
+    int mon;
+    unsigned int tags;
+}ProgramTagMonPair;
+
+ProgramTagMonPair* programtagmonpairarray = NULL;
 /* function declarations */
 static void applyrules(Client *c);
 static int applysizehints(Client *c, int *x, int *y, int *w, int *h, int interact);
@@ -235,6 +247,14 @@ static int xerrordummy(Display *dpy, XErrorEvent *ee);
 static int xerrorstart(Display *dpy, XErrorEvent *ee);
 static void zoom(const Arg *arg);
 
+
+/*own functions*/
+static pid_t winpid(Window w);
+static int pidtocmdline(int pid, char* out);
+static void spawnset(Arg* arg);
+static Monitor* numtomon(unsigned int num);
+static void sendmontag(Client* c, Monitor* m, unsigned int tags);
+
 /* variables */
 static const char broken[] = "broken";
 static char stext[256];
@@ -268,6 +288,8 @@ static Display *dpy;
 static Drw *drw;
 static Monitor *mons, *selmon;
 static Window root, wmcheckwin;
+
+static xcb_connection_t *xcon;
 
 /* configuration, allows nested code to access above variables */
 #include "config.h"
@@ -1024,6 +1046,7 @@ manage(Window w, XWindowAttributes *wa)
 
 	c = ecalloc(1, sizeof(Client));
 	c->win = w;
+    c->pid = winpid(w);
 	/* geometry */
 	c->x = c->oldx = wa->x;
 	c->y = c->oldy = wa->y;
@@ -1039,6 +1062,38 @@ manage(Window w, XWindowAttributes *wa)
 		c->mon = selmon;
 		applyrules(c);
 	}
+    if(programtagmonpairarray){
+        static int count = 0;
+        static int spwncount = 0;
+        static int tagmonpairspawncount = 0;
+        char cmdline[1024];
+        int sz = pidtocmdline(c->pid,cmdline);
+
+        if(spwncount == tagmonpairspawncount && !count){
+            for(int i=0;programtagmonpairarray[i].path != NULL;i++)
+                spwncount += programtagmonpairarray[i].spawncount;
+            tagmonpairspawncount = spwncount;
+        }
+
+        for(int i=0;programtagmonpairarray[i].path;i++){
+            if(!memcmp(programtagmonpairarray[i].path[0],cmdline,sz)){
+                Monitor* m = numtomon(programtagmonpairarray[i].mon);
+                unsigned int tags = programtagmonpairarray[i].tags;
+                c->mon = m ? m : selmon;
+                c->tags = tags ? tags : m->tagset[m->seltags];
+                if(spwncount) spwncount--;
+                else count++;
+                if(!programtagmonpairarray[count].path){
+                    programtagmonpairarray = NULL;
+                    count = 0;
+                    spwncount = 0;
+                    tagmonpairspawncount = 0;
+                    break;
+                }
+                break;
+            }
+        }
+    }
 
 	if (c->x + WIDTH(c) > c->mon->mx + c->mon->mw)
 		c->x = c->mon->mx + c->mon->mw - WIDTH(c);
@@ -2127,6 +2182,7 @@ zoom(const Arg *arg)
 	pop(c);
 }
 
+
 int
 main(int argc, char *argv[])
 {
@@ -2138,6 +2194,8 @@ main(int argc, char *argv[])
 		fputs("warning: no locale support\n", stderr);
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("dwm: cannot open display");
+	if (!(xcon = XGetXCBConnection(dpy)))
+		die("dwm: cannot get xcb connection\n");
 	checkotherwm();
 	setup();
 #ifdef __OpenBSD__
@@ -2149,4 +2207,99 @@ main(int argc, char *argv[])
 	cleanup();
 	XCloseDisplay(dpy);
 	return EXIT_SUCCESS;
+}
+
+
+
+
+int pidtocmdline(int pid, char* out){
+
+    char pidString[8];
+    char filepath[24] = "/proc/";
+
+    snprintf(pidString,8,"%d",pid);
+    strncat(filepath,pidString,8);
+    strncat(filepath,"/cmdline",9);
+    FILE* cmdlinefile = fopen(filepath, "r");
+    return fread(out,1,1024,cmdlinefile);
+}
+
+Monitor* numtomon(unsigned int num){
+    if(num == -1)
+        return NULL;
+    Monitor* mon;
+    for(mon = mons; mon->num!=num; mon = mon->next){}
+    return mon;
+}
+
+void sendmontag(Client* c, Monitor* m, unsigned int tags){
+	unfocus(c, 1);
+	detach(c);
+	detachstack(c);
+    c->mon = m ? m : selmon;
+    c->tags = tags ? tags : m->tagset[m->seltags];
+	attach(c);
+	attachstack(c);
+	focus(NULL);
+	arrange(NULL);
+}
+
+void spawnset(Arg* arg){
+     programtagmonpairarray = (ProgramTagMonPair*)arg->v;
+     for(int i=0;((ProgramTagMonPair*)arg->v)[i].path != NULL;i++){
+        Arg spawnarg = {.v = ((ProgramTagMonPair*)arg->v)[i].path};
+        spawn(&spawnarg);
+     }
+}
+
+pid_t winpid(Window w)
+{
+
+	pid_t result = 0;
+
+#ifdef __linux__
+	xcb_res_client_id_spec_t spec = {0};
+	spec.client = w;
+	spec.mask = XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID;
+
+	xcb_generic_error_t *e = NULL;
+	xcb_res_query_client_ids_cookie_t c = xcb_res_query_client_ids(xcon, 1, &spec);
+	xcb_res_query_client_ids_reply_t *r = xcb_res_query_client_ids_reply(xcon, c, &e);
+
+	if (!r)
+		return (pid_t)0;
+
+	xcb_res_client_id_value_iterator_t i = xcb_res_query_client_ids_ids_iterator(r);
+	for (; i.rem; xcb_res_client_id_value_next(&i)) {
+		spec = i.data->spec;
+		if (spec.mask & XCB_RES_CLIENT_ID_MASK_LOCAL_CLIENT_PID) {
+			uint32_t *t = xcb_res_client_id_value_value(i.data);
+			result = *t;
+			break;
+		}
+	}
+
+	free(r);
+
+	if (result == (pid_t)-1)
+		result = 0;
+
+#endif /* __linux__ */
+
+#ifdef __OpenBSD__
+        Atom type;
+        int format;
+        unsigned long len, bytes;
+        unsigned char *prop;
+        pid_t ret;
+
+        if (XGetWindowProperty(dpy, w, XInternAtom(dpy, "_NET_WM_PID", 0), 0, 1, False, AnyPropertyType, &type, &format, &len, &bytes, &prop) != Success || !prop)
+               return 0;
+
+        ret = *(pid_t*)prop;
+        XFree(prop);
+        result = ret;
+
+#endif /* __OpenBSD__ */
+	return result;
 }
