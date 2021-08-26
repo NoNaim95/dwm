@@ -2,10 +2,7 @@
  *
  * dynamic window manager is designed like any other X client as well. It is
  * driven through handling X events. In contrast to other X clients, a window
- * manager selects for SubstructureRedirectMask on the root window, to receive
- * events about window (dis-)appearance. Only one X connection at a time is
- * allowed to select for this event mask.
- *
+ * manager selects for SubstructureRedirectMask on the root window, to receive events about window (dis-)appearance. Only one X connection at a time is allowed to select for this event mask.  
  * The event handlers of dwm are organized in an array which is accessed
  * whenever a new event has been fetched. This allows event dispatching
  * in O(1) time.
@@ -25,6 +22,8 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/un.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -69,6 +68,10 @@ enum { WMProtocols, WMDelete, WMState, WMTakeFocus, WMLast }; /* default atoms *
 enum { ClkTagBar, ClkLtSymbol, ClkStatusText, ClkWinTitle,
        ClkClientWin, ClkRootWin, ClkLast }; /* clicks */
 
+/*own enums*/
+enum {HANDLESUCCESS, REQUEUE, MAXREQERROR};
+enum {SENDCLIENTREQ,MAXREQ};
+
 typedef union {
 	int i;
 	unsigned int ui;
@@ -86,6 +89,8 @@ typedef struct {
 
 typedef struct Monitor Monitor;
 typedef struct Client Client;
+typedef struct RequestPacket RequestPacket;
+
 struct Client {
 	char name[256];
 	float mina, maxa;
@@ -152,7 +157,18 @@ typedef struct {
     unsigned int tags;
 }ProgramTagMonPair;
 
+struct RequestPacket{
+    int id;
+    pid_t pid;
+    int mon;
+    unsigned int tags;
+    unsigned int requeuecount;
+    RequestPacket* next;
+};
 ProgramTagMonPair* programtagmonpairarray = NULL;
+RequestPacket* requesthead = NULL;
+pthread_mutex_t requestmtx;
+
 /* function declarations */
 static void applyrules(Client *c);
 static int applysizehints(Client *c, int *x, int *y, int *w, int *h, int interact);
@@ -254,9 +270,20 @@ static int pidtocmdline(int pid, char* out);
 static void spawnset(Arg* arg);
 static Monitor* numtomon(unsigned int num);
 static void sendmontag(Client* c, Monitor* m, unsigned int tags);
+static void* recvrequests(void* args);
+static RequestPacket* dequeuereq();
+static void enqueuereq(RequestPacket* req);
+
+static int sendreqcmd(RequestPacket* req);
+
+static int (*requesthandler[MAXREQ]) (RequestPacket*) = {
+	[SENDCLIENTREQ] = sendreqcmd,
+};
+
 
 /* variables */
 static const char broken[] = "broken";
+static const char dwmsocket[] = "/tmp/dwmsocket";
 static char stext[256];
 static int screen;
 static int sw, sh;           /* X display screen geometry width, height */
@@ -1431,9 +1458,32 @@ run(void)
 	XEvent ev;
 	/* main event loop */
 	XSync(dpy, False);
-	while (running && !XNextEvent(dpy, &ev))
-		if (handler[ev.type])
-			handler[ev.type](&ev); /* call handler */
+    while (running){
+        RequestPacket* req;
+        while((req = dequeuereq())){
+            int brk = 0;
+            if(req && requesthandler[req->id]){
+                switch(requesthandler[req->id](req)){
+                case REQUEUE:
+                    if(++req->requeuecount > 1)
+                        brk = 1;
+                    enqueuereq(req);
+                    break;
+                default:
+                    free(req);
+                    break;
+                }
+                if(brk)
+                    break;
+            }
+        }
+            
+
+        if(XNextEvent(dpy, &ev))
+            break;
+        if(handler[ev.type])
+            handler[ev.type](&ev); /* call handler */
+    }
 }
 
 void
@@ -2196,6 +2246,8 @@ main(int argc, char *argv[])
 		die("dwm: cannot open display");
 	if (!(xcon = XGetXCBConnection(dpy)))
 		die("dwm: cannot get xcb connection\n");
+    if (pthread_mutex_init(&requestmtx,NULL))
+        die("dwm: cannot initialize requestmutex");
 	checkotherwm();
 	setup();
 #ifdef __OpenBSD__
@@ -2203,10 +2255,40 @@ main(int argc, char *argv[])
 		die("pledge");
 #endif /* __OpenBSD__ */
 	scan();
+    pthread_t ipcthread;
+    pthread_create(&ipcthread,NULL,&recvrequests,NULL);
 	run();
 	cleanup();
 	XCloseDisplay(dpy);
 	return EXIT_SUCCESS;
+}
+
+void* recvrequests(void* args){
+    int sock, rval;
+    struct sockaddr_un server;
+    sock = socket(AF_UNIX,SOCK_DGRAM,0);
+    if(sock < 0)
+        die("error opening socket");
+
+    server.sun_family = AF_UNIX;
+    strcpy(server.sun_path, dwmsocket);
+    if(!access(dwmsocket,F_OK))
+        remove(dwmsocket);
+
+    if (bind(sock, (struct sockaddr *) &server, sizeof(struct sockaddr_un)))
+        die("error binding UDS");
+
+    while(1){
+        RequestPacket* node = (RequestPacket*) malloc(sizeof(RequestPacket));
+        bzero(node,sizeof(RequestPacket));
+        if ((rval = read(sock, node, sizeof(RequestPacket))) < 0)
+            perror("reading stream message");
+        else if (rval == 0)
+            printf("Ending connection\n");
+        else{
+            enqueuereq(node);
+        }
+    }
 }
 
 
@@ -2301,5 +2383,49 @@ pid_t winpid(Window w)
         result = ret;
 
 #endif /* __OpenBSD__ */
-	return result;
+	return result; } 
+Client* pidtoclient(pid_t pid){
+	Client *c;
+	Monitor *m;
+
+	for (m = mons; m; m = m->next)
+		for (c = m->clients; c; c = c->next)
+			if (c->pid == pid)
+				return c;
+	return NULL;
+}
+
+
+void enqueuereq(RequestPacket* req){
+    pthread_mutex_lock(&requestmtx);
+    RequestPacket* l;
+    if(!requesthead)
+        requesthead = req;
+    for(l = requesthead;l->next; l = l->next);
+    l->next = req;
+    req->next = NULL;
+    pthread_mutex_unlock(&requestmtx);
+}
+
+
+
+RequestPacket* dequeuereq(){
+    pthread_mutex_lock(&requestmtx);
+    if(requesthead){
+        RequestPacket* oldhead = requesthead;
+        requesthead = requesthead->next;
+        pthread_mutex_unlock(&requestmtx);
+        return oldhead;
+    }
+    pthread_mutex_unlock(&requestmtx);
+    return NULL;
+}
+
+
+int sendreqcmd(RequestPacket* req){
+    Client* c; 
+    if(!(c = pidtoclient(req->pid)))
+        return REQUEUE;
+    sendmontag(c,numtomon(req->mon),req->tags);
+    return HANDLESUCCESS;
 }
